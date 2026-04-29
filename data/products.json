@@ -1,0 +1,16 @@
+[
+  {
+    "sku": "first-background",
+    "name": "First Background",
+    "description": "Digital background (Code per E-Mail nach Kauf).",
+    "kind": "digital",
+    "prices": { "USD": 1000 },
+    "images": [
+      "https://example.com/images/first-background-1.png",
+      "https://example.com/images/first-background-2.png"
+    ],
+    "purchase_url": null,
+    "is_active": true
+  }
+]
+

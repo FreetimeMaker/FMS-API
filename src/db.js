@@ -59,6 +59,29 @@ export function migrate(db) {
       message TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS fx_rates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_currency TEXT NOT NULL,
+      to_currency TEXT NOT NULL,
+      rate REAL NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(from_currency, to_currency)
+    );
   `);
+
+  // Erweiterungen (bilder + multi-währung) für bestehende DBs
+  ensureColumn(db, "products", "image_urls", "TEXT"); // JSON-Array
+  ensureColumn(db, "products", "prices_json", "TEXT"); // JSON-Objekt: { "USD": 1000, "EUR": 900 }
+}
+
+function ensureColumn(db, table, column, typeSql) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some((c) => c.name === column)) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql}`);
+  } catch {
+    // no-op: falls parallel/mehrfach ausgeführt
+  }
 }
 

@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import swagger from "@fastify/swagger";
@@ -8,6 +10,7 @@ import { z } from "zod";
 import { env } from "./env.js";
 import { migrate, openDb } from "./db.js";
 import { seedIfEmpty } from "./seed.js";
+import { fetchOerCurrencies, fetchOerLatest, upsertFxRatesFromLatest } from "./fx.js";
 
 const app = Fastify({ logger: true });
 
@@ -40,20 +43,183 @@ seedIfEmpty(db);
 
 app.get("/health", async () => ({ ok: true, ts: new Date().toISOString() }));
 
+function safeJsonParse(raw, fallback) {
+  try {
+    if (raw == null || raw === "") return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function toProductOut(p) {
+  const images = safeJsonParse(p.image_urls, []);
+  const prices = safeJsonParse(p.prices_json, null);
+  const normalizedPrices =
+    prices && typeof prices === "object" && !Array.isArray(prices) ? prices : { [p.currency]: p.unit_amount };
+
+  return {
+    id: p.id,
+    sku: p.sku,
+    name: p.name,
+    description: p.description,
+    kind: p.kind,
+    purchase_url: p.purchase_url ?? null,
+    is_active: Boolean(p.is_active),
+    images: Array.isArray(images) ? images : [],
+    prices: normalizedPrices,
+  };
+}
+
+function normalizeProductFromFile(p) {
+  const images = Array.isArray(p.images)
+    ? p.images.map((u) => String(u).trim()).filter(Boolean)
+    : [];
+
+  const prices =
+    p.prices && typeof p.prices === "object" && !Array.isArray(p.prices) ? p.prices : null;
+  const normalizedPrices = prices
+    ? Object.fromEntries(
+        Object.entries(prices)
+          .map(([k, v]) => [String(k).toUpperCase(), Number(v)])
+          .filter(([k, v]) => k && Number.isFinite(v) && v >= 0)
+      )
+    : null;
+
+  const currency = String(p.currency ?? "USD").toUpperCase();
+  const unit_amount = Number(p.unit_amount ?? 0);
+  const derivedPrices =
+    normalizedPrices && Object.keys(normalizedPrices).length
+      ? normalizedPrices
+      : { [currency]: Number.isFinite(unit_amount) ? unit_amount : 0 };
+
+  return {
+    sku: String(p.sku ?? "").trim(),
+    name: String(p.name ?? "").trim(),
+    description: String(p.description ?? ""),
+    kind: String(p.kind ?? "digital"),
+    currency,
+    unit_amount: Number.isFinite(unit_amount) ? unit_amount : 0,
+    purchase_url: p.purchase_url ?? null,
+    is_active: p.is_active === false ? 0 : 1,
+    image_urls: JSON.stringify(images),
+    prices_json: JSON.stringify(derivedPrices),
+  };
+}
+
+function importProductsFromFile() {
+  const filePath = path.resolve(process.cwd(), "data", "products.json");
+  if (!fs.existsSync(filePath)) return { ok: false, reason: "missing_file" };
+
+  let json;
+  try {
+    json = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return { ok: false, reason: "invalid_json" };
+  }
+  if (!Array.isArray(json)) return { ok: false, reason: "not_array" };
+
+  const upsert = db.prepare(`
+    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json)
+    VALUES (@sku, @name, @description, @kind, @currency, @unit_amount, @purchase_url, @is_active, @image_urls, @prices_json)
+    ON CONFLICT(sku) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      kind = excluded.kind,
+      currency = excluded.currency,
+      unit_amount = excluded.unit_amount,
+      purchase_url = excluded.purchase_url,
+      is_active = excluded.is_active,
+      image_urls = excluded.image_urls,
+      prices_json = excluded.prices_json
+  `);
+
+  let imported = 0;
+  const tx = db.transaction(() => {
+    for (const p of json) {
+      const n = normalizeProductFromFile(p);
+      if (!n.sku || !n.name) continue;
+      upsert.run(n);
+      imported += 1;
+    }
+  });
+  tx();
+  return { ok: true, imported };
+}
+
+// Hot-import für data/products.json (ohne Server-Neustart)
+try {
+  importProductsFromFile();
+  const filePath = path.resolve(process.cwd(), "data", "products.json");
+  let debounceTimer = null;
+  fs.watch(filePath, { persistent: false }, () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const res = importProductsFromFile();
+      app.log.info({ res }, "Imported products.json");
+    }, 150);
+  });
+} catch {
+  // ignore
+}
+
+function requireAdmin(req, reply) {
+  if (!env.adminToken) {
+    return reply
+      .code(503)
+      .send({ detail: "admin_disabled", hint: "Setze FMS_ADMIN_TOKEN in .env" });
+  }
+  const token = req.headers["x-admin-token"];
+  if (!token || token !== env.adminToken) {
+    return reply.code(401).send({ detail: "unauthorized" });
+  }
+}
+
+function normCcy(ccy) {
+  return String(ccy ?? "").trim().toUpperCase();
+}
+
+function getFxRate(from, to) {
+  const f = normCcy(from);
+  const t = normCcy(to);
+  if (!f || !t) return null;
+  if (f === t) return 1;
+
+  const direct = db
+    .prepare("SELECT rate FROM fx_rates WHERE from_currency = ? AND to_currency = ?")
+    .get(f, t);
+  if (direct?.rate != null) return Number(direct.rate);
+
+  const inv = db
+    .prepare("SELECT rate FROM fx_rates WHERE from_currency = ? AND to_currency = ?")
+    .get(t, f);
+  if (inv?.rate != null && Number(inv.rate) !== 0) return 1 / Number(inv.rate);
+
+  // Fallback: Pivot über USD, wenn vorhanden
+  const usd = "USD";
+  if (f !== usd && t !== usd) {
+    const r1 = getFxRate(f, usd);
+    const r2 = getFxRate(usd, t);
+    if (r1 != null && r2 != null) return r1 * r2;
+  }
+
+  return null;
+}
+
 app.get("/products", async (req) => {
   const activeOnly = req.query?.active_only !== "false";
   const stmt = activeOnly
     ? db.prepare("SELECT * FROM products WHERE is_active = 1 ORDER BY id ASC")
     : db.prepare("SELECT * FROM products ORDER BY id ASC");
   const rows = stmt.all();
-  return rows.map((p) => ({ ...p, is_active: Boolean(p.is_active) }));
+  return rows.map(toProductOut);
 });
 
 app.get("/products/:sku", async (req, reply) => {
   const { sku } = req.params;
   const p = db.prepare("SELECT * FROM products WHERE sku = ?").get(sku);
   if (!p) return reply.code(404).send({ detail: "product_not_found" });
-  return { ...p, is_active: Boolean(p.is_active) };
+  return toProductOut(p);
 });
 
 app.get("/news", async (req) => {
@@ -63,6 +229,181 @@ app.get("/news", async (req) => {
     .all(limit);
   return rows;
 });
+
+app.get("/fx/rates", async () => {
+  const rows = db
+    .prepare(
+      "SELECT from_currency, to_currency, rate, updated_at FROM fx_rates ORDER BY from_currency ASC, to_currency ASC"
+    )
+    .all();
+  return rows;
+});
+
+app.get("/fx/status", async () => {
+  const row = db.prepare("SELECT MAX(updated_at) AS updated_at, COUNT(*) AS count FROM fx_rates").get();
+  return {
+    updated_at: row?.updated_at ?? null,
+    count: Number(row?.count ?? 0),
+    source: "openexchangerates",
+    include_alternative: Boolean(env.fxIncludeAlternative),
+    auto_refresh_seconds: Number(env.fxAutoRefreshSeconds),
+    configured: Boolean(env.oerAppId),
+  };
+});
+
+app.get("/fx/symbols", async () => {
+  const res = await fetchOerCurrencies({ includeAlternative: env.fxIncludeAlternative });
+  if (!res.ok) return { ok: false, error: res.error, status: res.status, body: res.body };
+  return { ok: true, symbols: res.data };
+});
+
+// --- Admin: Produkte pflegen ---
+const ProductUpsertIn = z.object({
+  sku: z.string().min(1).max(64),
+  name: z.string().min(1).max(200),
+  description: z.string().optional().default(""),
+  kind: z.enum(["digital", "donation", "token", "support"]),
+  currency: z.string().min(1).max(8).default("USD"), // fallback / default currency
+  unit_amount: z.number().int().min(0).default(0), // fallback / default price
+  prices: z.record(z.string(), z.number().int().min(0)).optional(), // { "USD": 1000, "EUR": 900 }
+  images: z.array(z.string().url()).optional(), // mehrere Bilder
+  purchase_url: z.string().url().optional().nullable(),
+  is_active: z.boolean().optional().default(true),
+});
+
+app.put("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply) => {
+  const parsed = ProductUpsertIn.safeParse({ ...(req.body ?? {}), sku: req.params.sku });
+  if (!parsed.success) {
+    return reply.code(400).send({ detail: "invalid_payload", issues: parsed.error.issues });
+  }
+  const p = parsed.data;
+
+  const normalizedPrices =
+    p.prices && Object.keys(p.prices).length
+      ? Object.fromEntries(Object.entries(p.prices).map(([k, v]) => [String(k).toUpperCase(), v]))
+      : { [String(p.currency).toUpperCase()]: p.unit_amount };
+
+  const imageUrls = Array.isArray(p.images) ? p.images : [];
+
+  db.prepare(
+    `
+    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(sku) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      kind = excluded.kind,
+      currency = excluded.currency,
+      unit_amount = excluded.unit_amount,
+      purchase_url = excluded.purchase_url,
+      is_active = excluded.is_active,
+      image_urls = excluded.image_urls,
+      prices_json = excluded.prices_json
+  `
+  ).run(
+    p.sku,
+    p.name,
+    p.description ?? "",
+    p.kind,
+    String(p.currency).toUpperCase(),
+    p.unit_amount,
+    p.purchase_url ?? null,
+    p.is_active ? 1 : 0,
+    JSON.stringify(imageUrls),
+    JSON.stringify(normalizedPrices)
+  );
+
+  const out = db.prepare("SELECT * FROM products WHERE sku = ?").get(p.sku);
+  return toProductOut(out);
+});
+
+app.delete("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply) => {
+  const { sku } = req.params;
+  const exists = db.prepare("SELECT id FROM products WHERE sku = ?").get(sku);
+  if (!exists) return reply.code(404).send({ detail: "product_not_found" });
+  db.prepare("UPDATE products SET is_active = 0 WHERE sku = ?").run(sku);
+  return { ok: true };
+});
+
+// --- Admin: News pflegen ---
+const NewsCreateIn = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(20000),
+});
+
+app.post("/admin/news", { preHandler: requireAdmin }, async (req, reply) => {
+  const parsed = NewsCreateIn.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ detail: "invalid_payload", issues: parsed.error.issues });
+  }
+  const n = parsed.data;
+  const created_at = new Date().toISOString();
+  const res = db
+    .prepare("INSERT INTO news (title, body, created_at) VALUES (?, ?, ?)")
+    .run(n.title, n.body, created_at);
+  return reply.code(201).send({ id: Number(res.lastInsertRowid), ...n, created_at });
+});
+
+// --- Admin: FX-Kurse pflegen ---
+const FxUpsertIn = z.object({
+  from_currency: z.string().min(3).max(8),
+  to_currency: z.string().min(3).max(8),
+  rate: z.number().positive(),
+});
+
+app.put("/admin/fx/rates", { preHandler: requireAdmin }, async (req, reply) => {
+  const parsed = FxUpsertIn.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ detail: "invalid_payload", issues: parsed.error.issues });
+  }
+  const r = parsed.data;
+  const from = normCcy(r.from_currency);
+  const to = normCcy(r.to_currency);
+  if (from === to) return reply.code(400).send({ detail: "from_equals_to" });
+  const updated_at = new Date().toISOString();
+
+  db.prepare(
+    `
+      INSERT INTO fx_rates (from_currency, to_currency, rate, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(from_currency, to_currency) DO UPDATE SET
+        rate = excluded.rate,
+        updated_at = excluded.updated_at
+    `
+  ).run(from, to, Number(r.rate), updated_at);
+
+  return { from_currency: from, to_currency: to, rate: Number(r.rate), updated_at };
+});
+
+app.post("/admin/fx/refresh", { preHandler: requireAdmin }, async (req, reply) => {
+  const latest = await fetchOerLatest({ includeAlternative: env.fxIncludeAlternative });
+  if (!latest.ok) {
+    return reply.code(502).send(latest);
+  }
+  const info = upsertFxRatesFromLatest(db, latest.data);
+  return { ok: true, ...info };
+});
+
+// Auto-Refresh (OpenExchangeRates) im Hintergrund
+async function fxAutoRefreshOnce() {
+  if (!env.oerAppId) return;
+  try {
+    const latest = await fetchOerLatest({ includeAlternative: env.fxIncludeAlternative });
+    if (!latest.ok) {
+      app.log.warn({ latest }, "FX refresh failed");
+      return;
+    }
+    const info = upsertFxRatesFromLatest(db, latest.data);
+    app.log.info({ info }, "FX refreshed");
+  } catch (e) {
+    app.log.warn({ err: String(e) }, "FX refresh exception");
+  }
+}
+
+// initial + interval
+fxAutoRefreshOnce();
+const fxIntervalMs = Math.max(60, Number(env.fxAutoRefreshSeconds || 3600)) * 1000;
+setInterval(fxAutoRefreshOnce, fxIntervalMs).unref();
 
 const CheckoutIn = z.object({
   email: z.string().email(),
@@ -75,6 +416,7 @@ const CheckoutIn = z.object({
     )
     .min(1),
   payment_provider: z.string().max(64).optional().nullable(),
+  currency: z.string().min(1).max(8).optional(), // gewünschte Zielwährung, z.B. EUR/CHF
 });
 
 app.post("/checkout", async (req, reply) => {
@@ -96,12 +438,10 @@ app.post("/checkout", async (req, reply) => {
     return reply.code(400).send({ detail: { code: "unknown_product_sku", skus: missing } });
   }
 
-  const currency = products[0]?.currency ?? "USD";
-  for (const p of products) {
-    if (p.currency !== currency) {
-      return reply.code(400).send({ detail: "mixed_currency_not_supported" });
-    }
-  }
+  const requestedCurrency = payload.currency ? String(payload.currency).toUpperCase() : null;
+  const currency =
+    requestedCurrency ??
+    String(products[0]?.currency ?? "USD").toUpperCase();
 
   let total = 0;
   const now = new Date().toISOString();
@@ -129,7 +469,37 @@ app.post("/checkout", async (req, reply) => {
 
     for (const it of payload.items) {
       const p = bySku.get(it.product_sku);
-      const unit = Number(p.unit_amount ?? 0);
+      const prices = safeJsonParse(p.prices_json, null);
+      const priceMap =
+        prices && typeof prices === "object" && !Array.isArray(prices)
+          ? prices
+          : { [normCcy(p.currency ?? "USD")]: Number(p.unit_amount ?? 0) };
+
+      let unit;
+      if (priceMap[currency] != null) {
+        unit = Number(priceMap[currency]);
+      } else {
+        // Kurswechsel: versuche aus einer vorhandenen Währung umzurechnen
+        const entries = Object.entries(priceMap);
+        const base = entries.find(([ccy, v]) => normCcy(ccy) && Number.isFinite(Number(v)));
+        if (!base) {
+          return reply.code(400).send({ detail: { code: "no_base_price", sku: p.sku } });
+        }
+        const [baseCcy, baseAmount] = base;
+        const rate = getFxRate(baseCcy, currency);
+        if (rate == null) {
+          return reply.code(400).send({
+            detail: {
+              code: "fx_rate_missing",
+              sku: p.sku,
+              from_currency: normCcy(baseCcy),
+              to_currency: currency,
+            },
+          });
+        }
+        unit = Math.round(Number(baseAmount) * Number(rate));
+      }
+
       total += unit * Number(it.quantity);
       insertItem.run(orderId, p.id, Number(it.quantity), unit, currency);
     }
