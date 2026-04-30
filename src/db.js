@@ -68,11 +68,24 @@ export function migrate(db) {
       updated_at TEXT NOT NULL,
       UNIQUE(from_currency, to_currency)
     );
+
+    CREATE TABLE IF NOT EXISTS payment_providers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slug TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'crypto',
+      website TEXT,
+      logo_url TEXT,
+      description TEXT NOT NULL DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1
+    );
   `);
 
   // Erweiterungen (bilder + multi-währung) für bestehende DBs
   ensureColumn(db, "products", "image_urls", "TEXT"); // JSON-Array
   ensureColumn(db, "products", "prices_json", "TEXT"); // JSON-Objekt: { "USD": 1000, "EUR": 900 }
+  // Pro Produkt: feste Checkout-Links pro Payment-Provider (Slug -> URL)
+  ensureColumn(db, "products", "payment_links_json", "TEXT");
 }
 
 function ensureColumn(db, table, column, typeSql) {

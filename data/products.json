@@ -4,12 +4,33 @@
     "name": "First Background",
     "description": "First Background is a digital product that you can download and use in your projects or as a wallpaper.",
     "kind": "digital",
-    "prices": { "USD": 200 },
+    "prices": { "USD": 1000 },
     "images": [
-      "https://raw.githubusercontent.com/Freetime-Maker/Freetime-Maker-Shop/blob/main/images/fb.png"
+      "https://freetimemaker.github.io/Freetime-Maker-Shop/images/fb.png"
     ],
-    "purchase_url": null,
-    "is_active": true
+    "purchase_url": "https://freetimemaker.github.io/Freetime-Maker-Shop/buy.fb.html",
+    "is_active": true,
+    "payment_links": {
+      "oxapay": "https://pay.oxapay.com/18186551",
+      "speedpay": "https://buy.tryspeed.com/plink_live_mmjeocrcKJd21Tr",
+      "plisio": "https://plisio.net/payment-button/new/GKfKl5fRu3U5",
+      "nowpayments": "https://nowpayments.io/payment/?iid=5865639269"
+    }
+  },
+  {
+    "sku": "donation",
+    "name": "Donation",
+    "description": "Support Freetime Maker with a free amount via crypto.",
+    "kind": "donation",
+    "prices": { "USD": 0 },
+    "images": [
+      "https://freetimemaker.github.io/Freetime-Maker-Shop/images/don.png"
+    ],
+    "purchase_url": "https://freetimemaker.github.io/Freetime-Maker-Shop/donations.html",
+    "is_active": true,
+    "payment_links": {
+      "oxapay": "https://pay.oxapay.com/13038067",
+      "ncwallet": "https://ncwallet.net/pay/02hanch"
+    }
   }
 ]
-

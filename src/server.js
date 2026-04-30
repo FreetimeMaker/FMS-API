@@ -67,6 +67,12 @@ function toProductOut(p) {
   const normalizedPrices =
     prices && typeof prices === "object" && !Array.isArray(prices) ? prices : { [p.currency]: p.unit_amount };
 
+  const paymentLinksRaw = safeJsonParse(p.payment_links_json, {});
+  const paymentLinks =
+    paymentLinksRaw && typeof paymentLinksRaw === "object" && !Array.isArray(paymentLinksRaw)
+      ? paymentLinksRaw
+      : {};
+
   return {
     id: p.id,
     sku: p.sku,
@@ -77,6 +83,7 @@ function toProductOut(p) {
     is_active: Boolean(p.is_active),
     images: Array.isArray(images) ? images : [],
     prices: normalizedPrices,
+    payment_links: paymentLinks,
   };
 }
 
@@ -102,6 +109,15 @@ function normalizeProductFromFile(p) {
       ? normalizedPrices
       : { [currency]: Number.isFinite(unit_amount) ? unit_amount : 0 };
 
+  const paymentLinks =
+    p.payment_links && typeof p.payment_links === "object" && !Array.isArray(p.payment_links)
+      ? Object.fromEntries(
+          Object.entries(p.payment_links)
+            .map(([k, v]) => [String(k).toLowerCase().trim(), String(v).trim()])
+            .filter(([k, v]) => k && v)
+        )
+      : {};
+
   return {
     sku: String(p.sku ?? "").trim(),
     name: String(p.name ?? "").trim(),
@@ -113,6 +129,7 @@ function normalizeProductFromFile(p) {
     is_active: p.is_active === false ? 0 : 1,
     image_urls: JSON.stringify(images),
     prices_json: JSON.stringify(derivedPrices),
+    payment_links_json: JSON.stringify(paymentLinks),
   };
 }
 
@@ -129,8 +146,8 @@ function importProductsFromFile() {
   if (!Array.isArray(json)) return { ok: false, reason: "not_array" };
 
   const upsert = db.prepare(`
-    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json)
-    VALUES (@sku, @name, @description, @kind, @currency, @unit_amount, @purchase_url, @is_active, @image_urls, @prices_json)
+    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json, payment_links_json)
+    VALUES (@sku, @name, @description, @kind, @currency, @unit_amount, @purchase_url, @is_active, @image_urls, @prices_json, @payment_links_json)
     ON CONFLICT(sku) DO UPDATE SET
       name = excluded.name,
       description = excluded.description,
@@ -140,7 +157,8 @@ function importProductsFromFile() {
       purchase_url = excluded.purchase_url,
       is_active = excluded.is_active,
       image_urls = excluded.image_urls,
-      prices_json = excluded.prices_json
+      prices_json = excluded.prices_json,
+      payment_links_json = excluded.payment_links_json
   `);
 
   let imported = 0;
@@ -280,6 +298,109 @@ app.get("/fx/symbols", async () => {
   };
 });
 
+// --- Payment Providers ---
+function toProviderOut(row) {
+  return {
+    slug: row.slug,
+    name: row.name,
+    kind: row.kind,
+    website: row.website ?? null,
+    logo_url: row.logo_url ?? null,
+    description: row.description ?? "",
+    is_active: Boolean(row.is_active),
+  };
+}
+
+app.get("/payment-providers", async (req) => {
+  const activeOnly = req.query?.active_only !== "false";
+  const rows = activeOnly
+    ? db
+        .prepare("SELECT * FROM payment_providers WHERE is_active = 1 ORDER BY name ASC")
+        .all()
+    : db.prepare("SELECT * FROM payment_providers ORDER BY name ASC").all();
+  return rows.map(toProviderOut);
+});
+
+app.get("/payment-providers/:slug", async (req, reply) => {
+  const slug = String(req.params.slug ?? "").toLowerCase();
+  const row = db.prepare("SELECT * FROM payment_providers WHERE slug = ?").get(slug);
+  if (!row) return reply.code(404).send({ detail: "payment_provider_not_found" });
+  return toProviderOut(row);
+});
+
+// Welche Provider-Checkout-Links sind für dieses Produkt hinterlegt?
+app.get("/products/:sku/payment-providers", async (req, reply) => {
+  const { sku } = req.params;
+  const p = db.prepare("SELECT * FROM products WHERE sku = ?").get(sku);
+  if (!p) return reply.code(404).send({ detail: "product_not_found" });
+  const links = safeJsonParse(p.payment_links_json, {}) ?? {};
+  const slugs = Object.keys(links);
+  if (!slugs.length) return [];
+  const placeholders = slugs.map(() => "?").join(",");
+  const providers = db
+    .prepare(
+      `SELECT * FROM payment_providers WHERE slug IN (${placeholders}) AND is_active = 1`
+    )
+    .all(...slugs);
+  return providers.map((row) => ({
+    ...toProviderOut(row),
+    checkout_url: links[row.slug],
+  }));
+});
+
+// --- Admin: Payment Providers pflegen ---
+const PaymentProviderUpsertIn = z.object({
+  name: z.string().min(1).max(100),
+  kind: z.string().min(1).max(40).default("crypto"),
+  website: z.string().url().optional().nullable(),
+  logo_url: z.string().url().optional().nullable(),
+  description: z.string().max(2000).optional().default(""),
+  is_active: z.boolean().optional().default(true),
+});
+
+app.put("/admin/payment-providers/:slug", { preHandler: requireAdmin }, async (req, reply) => {
+  const slug = String(req.params.slug ?? "").toLowerCase().trim();
+  if (!slug || !/^[a-z0-9][a-z0-9_-]*$/.test(slug)) {
+    return reply.code(400).send({ detail: "invalid_slug" });
+  }
+  const parsed = PaymentProviderUpsertIn.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ detail: "invalid_payload", issues: parsed.error.issues });
+  }
+  const p = parsed.data;
+  db.prepare(
+    `
+    INSERT INTO payment_providers (slug, name, kind, website, logo_url, description, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(slug) DO UPDATE SET
+      name = excluded.name,
+      kind = excluded.kind,
+      website = excluded.website,
+      logo_url = excluded.logo_url,
+      description = excluded.description,
+      is_active = excluded.is_active
+  `
+  ).run(
+    slug,
+    p.name,
+    p.kind,
+    p.website ?? null,
+    p.logo_url ?? null,
+    p.description ?? "",
+    p.is_active ? 1 : 0
+  );
+  const row = db.prepare("SELECT * FROM payment_providers WHERE slug = ?").get(slug);
+  return toProviderOut(row);
+});
+
+app.delete("/admin/payment-providers/:slug", { preHandler: requireAdmin }, async (req, reply) => {
+  const slug = String(req.params.slug ?? "").toLowerCase().trim();
+  const row = db.prepare("SELECT id FROM payment_providers WHERE slug = ?").get(slug);
+  if (!row) return reply.code(404).send({ detail: "payment_provider_not_found" });
+  db.prepare("UPDATE payment_providers SET is_active = 0 WHERE slug = ?").run(slug);
+  return { ok: true };
+});
+
 // --- Admin: Produkte pflegen ---
 const ProductUpsertIn = z.object({
   sku: z.string().min(1).max(64),
@@ -292,6 +413,8 @@ const ProductUpsertIn = z.object({
   images: z.array(z.string().url()).optional(), // mehrere Bilder
   purchase_url: z.string().url().optional().nullable(),
   is_active: z.boolean().optional().default(true),
+  // Pro Provider (slug) eine feste Checkout-URL, z.B. { "oxapay": "https://pay.oxapay.com/..." }
+  payment_links: z.record(z.string(), z.string().url()).optional(),
 });
 
 app.put("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply) => {
@@ -308,10 +431,30 @@ app.put("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply)
 
   const imageUrls = Array.isArray(p.images) ? p.images : [];
 
+  const paymentLinks = p.payment_links
+    ? Object.fromEntries(
+        Object.entries(p.payment_links).map(([k, v]) => [String(k).toLowerCase().trim(), String(v)])
+      )
+    : {};
+
+  // Unbekannte Provider-Slugs ablehnen, damit keine Tippfehler durchschlüpfen.
+  if (Object.keys(paymentLinks).length) {
+    const knownRows = db
+      .prepare("SELECT slug FROM payment_providers WHERE is_active = 1")
+      .all();
+    const known = new Set(knownRows.map((r) => r.slug));
+    const unknown = Object.keys(paymentLinks).filter((s) => !known.has(s));
+    if (unknown.length) {
+      return reply
+        .code(400)
+        .send({ detail: { code: "unknown_payment_provider", slugs: unknown } });
+    }
+  }
+
   db.prepare(
     `
-    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json, payment_links_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(sku) DO UPDATE SET
       name = excluded.name,
       description = excluded.description,
@@ -321,7 +464,8 @@ app.put("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply)
       purchase_url = excluded.purchase_url,
       is_active = excluded.is_active,
       image_urls = excluded.image_urls,
-      prices_json = excluded.prices_json
+      prices_json = excluded.prices_json,
+      payment_links_json = excluded.payment_links_json
   `
   ).run(
     p.sku,
@@ -333,7 +477,8 @@ app.put("/admin/products/:sku", { preHandler: requireAdmin }, async (req, reply)
     p.purchase_url ?? null,
     p.is_active ? 1 : 0,
     JSON.stringify(imageUrls),
-    JSON.stringify(normalizedPrices)
+    JSON.stringify(normalizedPrices),
+    JSON.stringify(paymentLinks)
   );
 
   const out = db.prepare("SELECT * FROM products WHERE sku = ?").get(p.sku);
@@ -466,6 +611,21 @@ app.post("/checkout", async (req, reply) => {
   }
   const payload = parsed.data;
 
+  // Provider validieren (falls angegeben). Akzeptiert Slug case-insensitive,
+  // wir speichern dann den normalisierten Slug.
+  let providerSlug = null;
+  if (payload.payment_provider) {
+    providerSlug = String(payload.payment_provider).toLowerCase().trim();
+    const provider = db
+      .prepare("SELECT slug FROM payment_providers WHERE slug = ? AND is_active = 1")
+      .get(providerSlug);
+    if (!provider) {
+      return reply
+        .code(400)
+        .send({ detail: { code: "unknown_payment_provider", slug: providerSlug } });
+    }
+  }
+
   const skus = [...new Set(payload.items.map((i) => i.product_sku))];
   const placeholders = skus.map(() => "?").join(",");
   const products = db
@@ -486,7 +646,10 @@ app.post("/checkout", async (req, reply) => {
   let total = 0;
   const now = new Date().toISOString();
   const publicId = newPublicId("ord");
-  const status = payload.payment_provider ? "pending_payment" : "created";
+  const status = providerSlug ? "pending_payment" : "created";
+  // Pro Item den passenden Provider-Checkout-Link sammeln (wenn der Provider
+  // gesetzt ist und das Produkt einen Link für genau diesen Provider hat).
+  const paymentUrls = [];
 
   const tx = db.transaction(() => {
     const orderRes = db
@@ -496,7 +659,7 @@ app.post("/checkout", async (req, reply) => {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `
       )
-      .run(publicId, payload.email, status, payload.payment_provider ?? null, currency, 0, now);
+      .run(publicId, payload.email, status, providerSlug, currency, 0, now);
 
     const orderId = orderRes.lastInsertRowid;
 
@@ -542,6 +705,14 @@ app.post("/checkout", async (req, reply) => {
 
       total += unit * Number(it.quantity);
       insertItem.run(orderId, p.id, Number(it.quantity), unit, currency);
+
+      if (providerSlug) {
+        const links = safeJsonParse(p.payment_links_json, {}) ?? {};
+        const url = links?.[providerSlug];
+        if (url) {
+          paymentUrls.push({ product_sku: p.sku, checkout_url: String(url) });
+        }
+      }
     }
 
     db.prepare("UPDATE orders SET total_amount = ? WHERE id = ?").run(total, orderId);
@@ -553,7 +724,8 @@ app.post("/checkout", async (req, reply) => {
     status,
     currency,
     total_amount: total,
-    payment_provider: payload.payment_provider ?? null,
+    payment_provider: providerSlug,
+    payment_urls: paymentUrls,
   });
 });
 
