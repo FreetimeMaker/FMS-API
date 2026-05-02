@@ -46,9 +46,19 @@ await app.register(swaggerUi, {
   routePrefix: "/docs",
 });
 
-const db = openDb();
-migrate(db);
-seedIfEmpty(db);
+// Initialize database - handle both sync (local) and async (Turso)
+let db;
+if (env.tursoDbUrl) {
+  // Turso: need to initialize async
+  db = await openDb();
+  await migrate(db);
+  await seedIfEmpty(db);
+} else {
+  // Local SQLite: sync
+  db = openDb();
+  migrate(db);
+  seedIfEmpty(db);
+}
 
 app.get("/health", async () => ({ ok: true, ts: new Date().toISOString() }));
 

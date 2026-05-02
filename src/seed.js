@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { env } from "./env.js";
 
 const nowIso = () => new Date().toISOString();
 
@@ -121,20 +122,45 @@ const DEFAULT_PAYMENT_PROVIDERS = [
   },
 ];
 
-function seedPaymentProviders(db) {
-  const upsert = db.prepare(`
-    INSERT INTO payment_providers (slug, name, kind, website, logo_url, description, is_active)
-    VALUES (@slug, @name, @kind, @website, @logo_url, @description, 1)
-    ON CONFLICT(slug) DO NOTHING
-  `);
-  const tx = db.transaction(() => {
-    for (const p of DEFAULT_PAYMENT_PROVIDERS) upsert.run(p);
-  });
-  tx();
+async function seedPaymentProviders(db) {
+  const isTurso = Boolean(db._isTurso);
+
+  if (isTurso) {
+    const client = db._client;
+    for (const p of DEFAULT_PAYMENT_PROVIDERS) {
+      await client.execute({
+        sql: `INSERT OR IGNORE INTO payment_providers (slug, name, kind, website, logo_url, description, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)`,
+        args: [p.slug, p.name, p.kind, p.website, p.logo_url, p.description],
+      });
+    }
+  } else {
+    // Local SQLite - use transaction
+    const upsert = db.prepare(`
+      INSERT INTO payment_providers (slug, name, kind, website, logo_url, description, is_active)
+      VALUES (@slug, @name, @kind, @website, @logo_url, @description, 1)
+      ON CONFLICT(slug) DO NOTHING
+    `);
+    const tx = db.transaction(() => {
+      for (const p of DEFAULT_PAYMENT_PROVIDERS) upsert.run(p);
+    });
+    tx();
+  }
 }
 
-export function seedIfEmpty(db) {
-  const hasProducts = db.prepare("SELECT id FROM products LIMIT 1").get() != null;
+export async function seedIfEmpty(db) {
+  const isTurso = Boolean(db._isTurso);
+
+  // Check if products exist
+  let hasProducts = false;
+  if (isTurso) {
+    const result = await db._client.execute({
+      sql: "SELECT id FROM products LIMIT 1",
+      args: [],
+    });
+    hasProducts = result.rows && result.rows.length > 0;
+  } else {
+    hasProducts = db.prepare("SELECT id FROM products LIMIT 1").get() != null;
+  }
 
   // Wenn du echte Produkte pflegen willst: lege `data/products.json` an (siehe example).
   const productsFile = path.resolve(process.cwd(), "data", "products.json");
@@ -167,37 +193,67 @@ export function seedIfEmpty(db) {
     ? fileProducts.map(normalizeProduct)
     : baseProducts;
 
-  const upsertProduct = db.prepare(`
-    INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json, payment_links_json)
-    VALUES (@sku, @name, @description, @kind, @currency, @unit_amount, @purchase_url, @is_active, @image_urls, @prices_json, @payment_links_json)
-    ON CONFLICT(sku) DO UPDATE SET
-      name = excluded.name,
-      description = excluded.description,
-      kind = excluded.kind,
-      currency = excluded.currency,
-      unit_amount = excluded.unit_amount,
-      purchase_url = excluded.purchase_url,
-      is_active = excluded.is_active,
-      image_urls = excluded.image_urls,
-      prices_json = excluded.prices_json,
-      payment_links_json = excluded.payment_links_json
-  `);
-
-  const tx = db.transaction(() => {
+  if (isTurso) {
+    const client = db._client;
     for (const p of products) {
       if (!p.sku || !p.name) continue;
-      upsertProduct.run(p);
+      await client.execute({
+        sql: `INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json, payment_links_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(sku) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                kind = excluded.kind,
+                currency = excluded.currency,
+                unit_amount = excluded.unit_amount,
+                purchase_url = excluded.purchase_url,
+                is_active = excluded.is_active,
+                image_urls = excluded.image_urls,
+                prices_json = excluded.prices_json,
+                payment_links_json = excluded.payment_links_json`,
+        args: [p.sku, p.name, p.description, p.kind, p.currency, p.unit_amount, p.purchase_url, p.is_active, p.image_urls, p.prices_json, p.payment_links_json],
+      });
     }
+
     if (!hasProducts) {
-      db.prepare("INSERT INTO news (title, body, created_at) VALUES (?, ?, ?)").run(
-        "Willkommen",
-        "Seed aktiv. Lege `data/products.json` an oder nutze die Admin-API zum Pflegen echter Produkte.",
-        nowIso()
-      );
+      await client.execute({
+        sql: "INSERT INTO news (title, body, created_at) VALUES (?, ?, ?)",
+        args: ["Willkommen", "Seed aktiv. Lege `data/products.json` an oder nutze die Admin-API zum Pflegen echter Produkte.", nowIso()],
+      });
     }
-  });
-  tx();
+  } else {
+    // Local SQLite - use transaction
+    const upsertProduct = db.prepare(`
+      INSERT INTO products (sku, name, description, kind, currency, unit_amount, purchase_url, is_active, image_urls, prices_json, payment_links_json)
+      VALUES (@sku, @name, @description, @kind, @currency, @unit_amount, @purchase_url, @is_active, @image_urls, @prices_json, @payment_links_json)
+      ON CONFLICT(sku) DO UPDATE SET
+        name = excluded.name,
+        description = excluded.description,
+        kind = excluded.kind,
+        currency = excluded.currency,
+        unit_amount = excluded.unit_amount,
+        purchase_url = excluded.purchase_url,
+        is_active = excluded.is_active,
+        image_urls = excluded.image_urls,
+        prices_json = excluded.prices_json,
+        payment_links_json = excluded.payment_links_json
+    `);
 
-  seedPaymentProviders(db);
+    const tx = db.transaction(() => {
+      for (const p of products) {
+        if (!p.sku || !p.name) continue;
+        upsertProduct.run(p);
+      }
+      if (!hasProducts) {
+        db.prepare("INSERT INTO news (title, body, created_at) VALUES (?, ?, ?)").run(
+          "Willkommen",
+          "Seed aktiv. Lege `data/products.json` an oder nutze die Admin-API zum Pflegen echter Produkte.",
+          nowIso()
+        );
+      }
+    });
+    tx();
+  }
+
+  await seedPaymentProviders(db);
 }
-
